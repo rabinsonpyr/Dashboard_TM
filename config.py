@@ -32,5 +32,5 @@ def get_secret(name: str, default=None):
         return default
 
 
-GOOGLE_DRIVE_FILE_ID = get_secret("GOOGLE_DRIVE_FILE_ID", "")
+GOOGLE_DRIVE_FILE_ID = get_secret("GOOGLE_DRIVE_FILE_ID", "1Y2dqYUGIhkAggXpUnlZ0_6Iv374BMFsn")
 APP_PASSWORD = get_secret("APP_PASSWORD", "Tandoori2026")
