@@ -101,7 +101,7 @@ def load_data() -> pd.DataFrame:
 
 df = load_data()
 
-st.title("📊 Sales Dashboard")
+st.title("📊 Sales Dashboard (Tandoori Masala, Nørrebro)")
 
 col_title, col_refresh = st.columns([5, 1])
 with col_refresh:
