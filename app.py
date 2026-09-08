@@ -38,7 +38,7 @@ def check_password() -> bool:
     if st.session_state.get("authenticated"):
         return True
 
-    st.title("🔒 Sales Dashboard")
+    st.title("🔒 Sales Dashboard (Tandoori Masala, Nørrebro)")
     pwd = st.text_input("Password", type="password")
     if st.button("Enter"):
         if pwd == config.APP_PASSWORD:
