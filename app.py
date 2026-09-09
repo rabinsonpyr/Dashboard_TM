@@ -10,14 +10,15 @@ import streamlit as st
 st.set_page_config(page_title="Sales Dashboard", layout="wide")
 
 import io
+import datetime
 import logging
 
-import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
 import config
+import drive_utils
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dashboard")
@@ -53,30 +54,31 @@ if not check_password():
 
 
 # ---------------------------------------------------------------------------
-# Data loading — fetch the Excel file from Google Drive and clean it
+# Data loading — fetch the Excel file from Google Drive (via service account)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=config.REFRESH_SECONDS, show_spinner="Fetching latest data...")
-def load_data() -> pd.DataFrame:
+def fetch_raw_excel() -> pd.DataFrame:
+    """Downloads the current Excel file from Drive, unmodified/uncleaned."""
     if not config.GOOGLE_DRIVE_FILE_ID:
         st.error(
             "No GOOGLE_DRIVE_FILE_ID configured. Add it under this app's "
             "Settings → Secrets on Streamlit Cloud."
         )
         st.stop()
-
-    url = f"https://drive.google.com/uc?export=download&id={config.GOOGLE_DRIVE_FILE_ID}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-
     try:
-        df = pd.read_excel(io.BytesIO(resp.content))
-    except Exception:
+        raw_bytes = drive_utils.download_excel_bytes(config.GOOGLE_DRIVE_FILE_ID)
+        return pd.read_excel(io.BytesIO(raw_bytes))
+    except Exception as e:
         st.error(
-            "Could not read the Excel file from Google Drive. Make sure the "
-            "file is shared as 'Anyone with the link can view' and that the "
-            "GOOGLE_DRIVE_FILE_ID secret is correct."
+            f"Could not read the Excel file from Google Drive ({e}). Make sure "
+            "the service account has access to the file and GOOGLE_DRIVE_FILE_ID "
+            "is correct."
         )
         st.stop()
+
+
+@st.cache_data(ttl=config.REFRESH_SECONDS, show_spinner="Fetching latest data...")
+def load_data() -> pd.DataFrame:
+    df = fetch_raw_excel()
 
     required = [
         config.COL_DATE, config.COL_SALES, config.COL_WOLT,
@@ -113,6 +115,61 @@ with col_refresh:
         st.rerun()
 
 st.caption(f"Data auto-refreshes at least every {config.REFRESH_SECONDS} seconds.")
+
+# ---------------------------------------------------------------------------
+# Add today's entry — writes a new row directly to the Google Drive file
+# ---------------------------------------------------------------------------
+with st.expander("➕ Add a day's entry", expanded=False):
+    existing_people = sorted(df[config.COL_PERSON].dropna().unique().tolist()) if not df.empty else []
+
+    with st.form("add_entry_form", clear_on_submit=True):
+        entry_date = st.date_input("Date", value=datetime.date.today())
+
+        person_choice = st.selectbox("Person", options=existing_people + ["Someone new..."])
+        new_person_name = ""
+        if person_choice == "Someone new...":
+            new_person_name = st.text_input("Enter name")
+
+        c1, c2, c3 = st.columns(3)
+        tillty_val = c1.number_input(f"{config.COL_SALES} ({config.CURRENCY})", min_value=0.0, step=1.0)
+        wolt_val = c2.number_input(f"{config.COL_WOLT} ({config.CURRENCY})", min_value=0.0, step=1.0)
+        ubereats_val = c3.number_input(f"{config.COL_UBEREATS} ({config.CURRENCY})", min_value=0.0, step=1.0)
+
+        c4, c5 = st.columns(2)
+        tips_val = c4.number_input(f"{config.COL_TIPS} ({config.CURRENCY})", min_value=0.0, step=1.0)
+        cash_val = c5.number_input(f"{config.COL_CASH} ({config.CURRENCY})", min_value=0.0, step=1.0)
+
+        computed_total = tillty_val + wolt_val + ubereats_val
+        st.caption(f"{config.COL_TOTAL} (auto-calculated): **{computed_total:,.0f} {config.CURRENCY}**")
+
+        submitted = st.form_submit_button("Save entry")
+
+        if submitted:
+            final_person = new_person_name.strip() if person_choice == "Someone new..." else person_choice
+            if not final_person:
+                st.error("Please enter a person's name.")
+            else:
+                raw_df = fetch_raw_excel()
+                new_row = {
+                    config.COL_DATE: pd.Timestamp(entry_date),
+                    config.COL_SALES: tillty_val,
+                    config.COL_WOLT: wolt_val,
+                    config.COL_UBEREATS: ubereats_val,
+                    config.COL_TOTAL: computed_total,
+                    config.COL_TIPS: tips_val,
+                    config.COL_PERSON: final_person,
+                    config.COL_CASH: cash_val,
+                }
+                raw_df = pd.concat([raw_df, pd.DataFrame([new_row])], ignore_index=True)
+
+                out_buf = io.BytesIO()
+                raw_df.to_excel(out_buf, index=False)
+                out_buf.seek(0)
+                drive_utils.upload_excel_bytes(config.GOOGLE_DRIVE_FILE_ID, out_buf.read())
+
+                st.cache_data.clear()
+                st.success(f"Saved entry for {final_person} on {entry_date}.")
+                st.rerun()
 
 with st.expander("🔍 Debug info (click if the dashboard looks empty)"):
     st.write(f"Rows loaded: **{len(df)}**")
@@ -175,6 +232,9 @@ daily_channel = (
     .sum()
     .reset_index()
 )
+daily_channel["Computed Total"] = (
+    daily_channel[config.COL_SALES] + daily_channel[config.COL_WOLT] + daily_channel[config.COL_UBEREATS]
+)
 melted = daily_channel.melt(
     id_vars=[config.COL_DATE],
     value_vars=[config.COL_SALES, config.COL_WOLT, config.COL_UBEREATS],
@@ -185,13 +245,23 @@ fig1 = px.area(
     melted, x=config.COL_DATE, y="Revenue", color="Channel",
     color_discrete_map=CHANNEL_COLORS,
     labels={config.COL_DATE: "Date", "Revenue": f"Revenue ({config.CURRENCY})"},
-    text="Revenue",
 )
-fig1.update_xaxes(tickformat="%Y-%m-%d", dtick="D1", hoverformat="%Y-%m-%d (%A)")
+fig1.update_xaxes(tickformat="%Y-%m-%d<br>(%a)", dtick="D1", hoverformat="%Y-%m-%d (%A)")
 fig1.update_traces(
-    textposition="top center", texttemplate=f"%{{y:,.0f}} {config.CURRENCY}",
+    mode="lines+markers",
+    marker=dict(size=6),
     hovertemplate=f"%{{fullData.name}}: %{{y:,.0f}} {config.CURRENCY}<extra></extra>",
 )
+# Hidden trace purely so "Total" shows up in the combined hover tooltip
+fig1.add_trace(go.Scatter(
+    x=daily_channel[config.COL_DATE],
+    y=daily_channel["Computed Total"],
+    mode="lines",
+    line=dict(width=0),
+    opacity=0,
+    showlegend=False,
+    hovertemplate=f"Total: %{{y:,.0f}} {config.CURRENCY}<extra></extra>",
+))
 fig1.update_layout(hovermode="x unified")
 st.plotly_chart(fig1, use_container_width=True)
 
@@ -251,10 +321,6 @@ with col_c:
     st.plotly_chart(fig5, use_container_width=True)
 
 st.subheader("Total Sales per Day")
-
-daily_channel["Computed Total"] = (
-    daily_channel[config.COL_SALES] + daily_channel[config.COL_WOLT] + daily_channel[config.COL_UBEREATS]
-)
 
 fig4 = px.bar(
     melted, x=config.COL_DATE, y="Revenue", color="Channel",
